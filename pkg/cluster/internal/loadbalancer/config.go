@@ -20,16 +20,35 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"net/netip"
+	"sort"
+	"strconv"
+	"strings"
 	"text/template"
 
 	"sigs.k8s.io/kind/pkg/errors"
 )
 
 // ConfigData is supplied to the loadbalancer config template
+//
+// The generated config is a pure function of this input. See the package
+// documentation for which inputs must and must not affect the output.
 type ConfigData struct {
 	ControlPlanePort int
-	BackendServers   map[string]string
-	IPv6             bool
+	// BackendServers maps a control-plane node name to its "host:port"
+	// backend address. Iteration order of this map never affects the
+	// generated config: entries are sorted by node name before rendering.
+	BackendServers map[string]string
+	IPv6           bool
+}
+
+// Backend is a single resolved backend server entry, ready for rendering.
+type Backend struct {
+	// Name is the control-plane node name. Backends are sorted by Name.
+	Name string
+	// Host and Port are the parsed backend address.
+	Host string
+	Port string
 }
 
 // DynamicFilesystemConfigTemplate holds the Envoy bootstrap configuration template
@@ -123,37 +142,133 @@ resources:
     cluster_name: kube_apiservers
     endpoints:
     - lb_endpoints:
-{{- range $server, $address := .BackendServers }}
-{{- $hp := hostPort $address }}
+{{- range .Backends }}
       - endpoint:
           address:
             socket_address:
-              address: {{ $hp.host }}
-              port_value: {{ $hp.port }}
+              address: {{ .Host }}
+              port_value: {{ .Port }}
 {{- end }}
 `
 
-func hostPort(addr string) (map[string]string, error) {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]string{"host": host, "port": port}, nil
+// configTemplateData is the view of ConfigData actually passed to the
+// templates: backends are resolved, validated and sorted exactly once by
+// Config, so rendering never depends on map iteration order.
+type configTemplateData struct {
+	ControlPlanePort int
+	IPv6             bool
+	Backends         []Backend
 }
 
-// Config returns a kubeadm config generated from config data, in particular
-// the kubernetes version
-func Config(data *ConfigData, configTemplate string) (config string, err error) {
-	funcs := template.FuncMap{
-		"hostPort": hostPort,
+// resolveBackends validates the backend servers and returns them as a list
+// sorted by node name.
+//
+// Sorting by node name (rather than by address) keeps the output stable
+// across the cluster lifecycle: node names never change, while addresses
+// may be re-assigned by the container runtime. Any error — a malformed
+// address, a duplicate address, or an empty backend set — fails the whole
+// generation; a backend is never silently omitted.
+func resolveBackends(servers map[string]string) ([]Backend, error) {
+	if len(servers) == 0 {
+		return nil, errors.New("no backend servers: refusing to generate a loadbalancer config without any control-plane backend")
 	}
-	t, err := template.New("loadbalancer-config").Funcs(funcs).Parse(configTemplate)
+	names := make([]string, 0, len(servers))
+	for name := range servers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	backends := make([]Backend, 0, len(names))
+	seen := make(map[string]string, len(servers)) // canonical address -> first node name
+	for _, name := range names {
+		host, port, err := net.SplitHostPort(servers[name])
+		if err != nil {
+			return nil, errors.Wrapf(err, "invalid backend address %q for server %q", servers[name], name)
+		}
+		key, err := canonicalHostPort(host, port)
+		if err != nil {
+			return nil, errors.Wrapf(err, "invalid backend address %q for server %q", servers[name], name)
+		}
+		if prev, ok := seen[key]; ok {
+			return nil, errors.Errorf(
+				"backend servers %q and %q resolve to the same address %q: "+
+					"two control-plane nodes indistinguishable to the loadbalancer indicate a broken address assignment; "+
+					"refusing to generate a silently degraded config",
+				prev, name, servers[name])
+		}
+		seen[key] = name
+		backends = append(backends, Backend{Name: name, Host: host, Port: port})
+	}
+	return backends, nil
+}
+
+// canonicalHostPort returns a canonical form of a host:port pair so that
+// addresses can be compared by meaning rather than by spelling:
+//   - IP hosts are normalized with netip (e.g. "2001:0db8::1" and
+//     "2001:db8::1" are the same address; IPv4-in-IPv6 is unmapped)
+//   - hostname hosts are lower-cased (DNS names are case-insensitive)
+//   - ports are compared numerically (e.g. "6443" and "06443" are equal)
+func canonicalHostPort(host, port string) (string, error) {
+	if addr, err := netip.ParseAddr(host); err == nil {
+		host = addr.Unmap().String()
+	} else {
+		host = strings.ToLower(host)
+	}
+	portNum, err := strconv.Atoi(port)
+	if err != nil {
+		return "", errors.Wrapf(err, "invalid port %q", port)
+	}
+	return host + ":" + strconv.Itoa(portNum), nil
+}
+
+// HostPortEqual reports whether two "host:port" backend addresses are
+// semantically equal, independent of spelling differences such as IPv6
+// abbreviation forms. It returns an error if either address is malformed.
+func HostPortEqual(a, b string) (bool, error) {
+	hostA, portA, err := net.SplitHostPort(a)
+	if err != nil {
+		return false, errors.Wrapf(err, "invalid address %q", a)
+	}
+	hostB, portB, err := net.SplitHostPort(b)
+	if err != nil {
+		return false, errors.Wrapf(err, "invalid address %q", b)
+	}
+	keyA, err := canonicalHostPort(hostA, portA)
+	if err != nil {
+		return false, errors.Wrapf(err, "invalid address %q", a)
+	}
+	keyB, err := canonicalHostPort(hostB, portB)
+	if err != nil {
+		return false, errors.Wrapf(err, "invalid address %q", b)
+	}
+	return keyA == keyB, nil
+}
+
+// Config returns a loadbalancer config generated from config data.
+//
+// The output is deterministic: the same ConfigData always produces
+// byte-identical output, regardless of the order in which backends were
+// discovered or inserted into ConfigData.BackendServers.
+func Config(data *ConfigData, configTemplate string) (config string, err error) {
+	// parse the template first so template syntax errors are reported
+	// before any input validation error
+	t, err := template.New("loadbalancer-config").Parse(configTemplate)
 	if err != nil {
 		return "", errors.Wrap(err, "failed to parse config template")
 	}
+	// resolve and validate the backends exactly once; any failure here
+	// fails the whole generation rather than producing a partial config
+	backends, err := resolveBackends(data.BackendServers)
+	if err != nil {
+		return "", err
+	}
 	// execute the template
 	var buff bytes.Buffer
-	err = t.Execute(&buff, data)
+	err = t.Execute(&buff, &configTemplateData{
+		ControlPlanePort: data.ControlPlanePort,
+		IPv6:             data.IPv6,
+		Backends:         backends,
+	})
 	if err != nil {
 		return "", errors.Wrap(err, "error executing config template")
 	}

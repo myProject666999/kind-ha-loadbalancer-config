@@ -22,11 +22,13 @@ import (
 
 	"sigs.k8s.io/kind/pkg/cluster/constants"
 	"sigs.k8s.io/kind/pkg/errors"
+	"sigs.k8s.io/kind/pkg/exec"
 	"sigs.k8s.io/kind/pkg/internal/apis/config"
 
 	"sigs.k8s.io/kind/pkg/cluster/internal/create/actions"
 	"sigs.k8s.io/kind/pkg/cluster/internal/loadbalancer"
 	"sigs.k8s.io/kind/pkg/cluster/internal/providers/common"
+	"sigs.k8s.io/kind/pkg/cluster/nodes"
 	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
 )
 
@@ -62,6 +64,11 @@ func (a *Action) Execute(ctx *actions.ActionContext) error {
 	defer ctx.Status.End(false)
 
 	// collect info about the existing controlplane nodes
+	// NOTE: the backend host is the node (container) name, not an IP:
+	// envoy resolves it through the runtime's embedded DNS (STRICT_DNS),
+	// so container IP re-assignment is handled by envoy and does not
+	// require regenerating this config. Each node's backend string is
+	// built exactly once here; generation fails as a whole on any error.
 	var backendServers = map[string]string{}
 	controlPlaneNodes, err := nodeutils.SelectNodesByRole(
 		allNodes,
@@ -90,6 +97,16 @@ func (a *Action) Execute(ctx *actions.ActionContext) error {
 		return errors.Wrap(err, "failed to generate loadbalancer config data")
 	}
 
+	// Skip the update entirely if the applied config is already identical.
+	// Generation is deterministic, so byte equality means "no change";
+	// reloading anyway would make envoy re-apply the same config for
+	// nothing. A missing/unreadable file counts as "changed".
+	if ldsUnchanged, cdsUnchanged := appliedConfigMatches(loadBalancerNode, loadbalancer.ProxyConfigPathLDS, ldsConfig),
+		appliedConfigMatches(loadBalancerNode, loadbalancer.ProxyConfigPathCDS, cdsConfig); ldsUnchanged && cdsUnchanged {
+		ctx.Status.End(true)
+		return nil
+	}
+
 	// Atomic Update inside the container
 	tmpLDS := loadbalancer.ProxyConfigPathLDS + ".tmp"
 	tmpCDS := loadbalancer.ProxyConfigPathCDS + ".tmp"
@@ -107,4 +124,14 @@ func (a *Action) Execute(ctx *actions.ActionContext) error {
 
 	ctx.Status.End(true)
 	return nil
+}
+
+// appliedConfigMatches reports whether the file at path on the
+// loadbalancer node already contains exactly content.
+func appliedConfigMatches(loadBalancerNode nodes.Node, path, content string) bool {
+	existing, err := exec.Output(loadBalancerNode.Command("cat", path))
+	if err != nil {
+		return false
+	}
+	return string(existing) == content
 }
